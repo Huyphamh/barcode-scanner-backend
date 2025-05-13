@@ -8,7 +8,7 @@ const path = require("path");
 const { google } = require("googleapis");
 const cors = require("cors");
 const { readBarcodesFromImageData } = require("zxing-wasm");
-const bodyParser = require("body-parser");
+const { GoogleSpreadsheet } = require("google-spreadsheet");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -54,9 +54,6 @@ app.post("/upload", upload.single("image"), async (req, res) => {
     const filePath = req.file.path;
     const processedFilePath = path.join(processedDir, `${Date.now()}.png`);
 
-    console.log("📷 Xử lý ảnh:", filePath);
-
-    // Xử lý ảnh (grayscale, sharpen, resize để tối ưu nhận diện)
     await sharp(filePath)
       .grayscale()
       .sharpen()
@@ -64,14 +61,11 @@ app.post("/upload", upload.single("image"), async (req, res) => {
       .toFormat("png")
       .toFile(processedFilePath);
 
-    // Đọc ảnh thành buffer
     const imageBuffer = fs.readFileSync(processedFilePath);
 
-    // Quét tất cả mã vạch có trong ảnh
     const results = await readBarcodesFromImageData(imageBuffer);
-    const barcodes = results.map((result) => result.text); // Lưu danh sách mã vạch
+    const barcodes = results.map((result) => result.text);
 
-    // Xóa ảnh gốc sau khi xử lý
     fs.unlinkSync(filePath);
     fs.unlinkSync(processedFilePath);
 
@@ -81,7 +75,6 @@ app.post("/upload", upload.single("image"), async (req, res) => {
         .json({ success: false, message: "Không tìm thấy mã vạch trong ảnh!" });
     }
 
-    console.log("✅ Mã vạch quét được:", barcodes);
     res.json({ success: true, barcodes });
   } catch (error) {
     console.error("❌ Lỗi quét mã vạch:", error);
@@ -102,26 +95,29 @@ app.post("/export-excel", async (req, res) => {
         .json({ success: false, message: "Dữ liệu không hợp lệ!" });
     }
 
-    const filePath = path.join(exportDir, `output_${Date.now()}.xlsx`);
-
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet("Barcode Data");
 
-    // Tiêu đề cột
     worksheet.columns = [
       { header: "STT", key: "index", width: 10 },
       { header: "Mã Vạch", key: "barcode", width: 30 },
     ];
 
-    // Thêm dữ liệu vào Excel
     data.forEach((barcode, index) => {
       worksheet.addRow({ index: index + 1, barcode });
     });
 
-    // Xuất file Excel
-    await workbook.xlsx.writeFile(filePath);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=barcode_data_${Date.now()}.xlsx`
+    );
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
 
-    res.json({ success: true, file: filePath });
+    await workbook.xlsx.write(res);
+    res.end();
   } catch (error) {
     console.error("❌ Lỗi xuất Excel:", error);
     res.status(500).json({ success: false, message: "Lỗi server!" });
@@ -129,69 +125,75 @@ app.post("/export-excel", async (req, res) => {
 });
 
 /**
- * 📌 API: Nhập dữ liệu vào Google Sheets
+ * 📌 Khởi tạo Google Sheets & Server
  */
-const CREDENTIALS = JSON.parse(process.env.GOOGLE_CLOUD_CREDENTIALS); // Đảm bảo tệp JSON đúng
-
-const auth = new google.auth.GoogleAuth({
-  credentials: CREDENTIALS,
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
-
-const sheets = google.sheets({ version: "v4", auth });
-
-app.post("/upload-google-sheet", async (req, res) => {
+const startServer = async () => {
   try {
-    const { sheetUrl, barcodes } = req.body;
+    const CREDENTIALS = JSON.parse(process.env.GOOGLE_CLOUD_CREDENTIALS);
+    CREDENTIALS.private_key = CREDENTIALS.private_key.replace(/\\n/g, "\n");
 
-    // ✅ Kiểm tra sheetUrl hợp lệ
-    const match = sheetUrl.match(/\/d\/([a-zA-Z0-9-_]+)/);
-    if (!match) {
-      return res
-        .status(400)
-        .json({ success: false, message: "❌ URL Google Sheet không hợp lệ!" });
-    }
-    const sheetId = match[1];
-    console.log("📌 Sheet ID:", sheetId);
-
-    // ✅ Kiểm tra barcodes hợp lệ
-    if (
-      !Array.isArray(barcodes) ||
-      barcodes.length === 0 ||
-      !barcodes.every((b) => typeof b === "string")
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "❌ Dữ liệu phải là một mảng chuỗi hợp lệ!",
-      });
-    }
-    console.log("📌 Barcodes gửi:", barcodes);
-    //console.log("📌 Barcodes:", JSON.stringify(barcodes, null, 2));
-
-    // ✅ Ghi dữ liệu vào Google Sheets
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: sheetId,
-      range: "Sheet1!A:A",
-      valueInputOption: "RAW",
-      insertDataOption: "INSERT_ROWS",
-      requestBody: { values: barcodes.map((code) => [code]) },
+    const auth = new google.auth.GoogleAuth({
+      credentials: CREDENTIALS,
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
     });
 
-    res.json({
-      success: true,
-      message: "✅ Đã ghi dữ liệu vào Google Sheets!",
+    const sheets = google.sheets({ version: "v4", auth });
+
+    app.post("/upload-google-sheet", async (req, res) => {
+      try {
+        const { sheetUrl, barcodes } = req.body;
+
+        const match = sheetUrl.match(/\/d\/([a-zA-Z0-9-_]+)/);
+        if (!match) {
+          return res
+            .status(400)
+            .json({
+              success: false,
+              message: "❌ URL Google Sheet không hợp lệ!",
+            });
+        }
+
+        const sheetId = match[1];
+
+        if (
+          !Array.isArray(barcodes) ||
+          barcodes.length === 0 ||
+          !barcodes.every((b) => typeof b === "string")
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: "❌ Dữ liệu phải là một mảng chuỗi hợp lệ!",
+          });
+        }
+
+        await sheets.spreadsheets.values.append({
+          spreadsheetId: sheetId,
+          range: "Sheet1!A:A",
+          valueInputOption: "RAW",
+          insertDataOption: "INSERT_ROWS",
+          requestBody: { values: barcodes.map((code) => [code]) },
+        });
+
+        res.json({
+          success: true,
+          message: "✅ Đã ghi dữ liệu vào Google Sheets!",
+        });
+      } catch (error) {
+        console.error("❌ Google Sheets API Error:", error.message);
+        res.status(500).json({
+          success: false,
+          message: "Lỗi server khi ghi Google Sheets!",
+          error: error.message,
+        });
+      }
     });
-  } catch (error) {
-    console.error("❌ Google Sheets API Error:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Lỗi server khi ghi Google Sheets!",
-      error: error.message,
+
+    app.listen(PORT, () => {
+      console.log(`🚀 Server chạy trên http://localhost:${PORT}`);
     });
+  } catch (err) {
+    console.error("❌ Lỗi khi khởi tạo Google Sheets:", err.message);
   }
-});
+};
 
-// Chạy server
-app.listen(PORT, () => {
-  console.log(`🚀 Server chạy trên http://localhost:${PORT}`);
-});
+startServer();
